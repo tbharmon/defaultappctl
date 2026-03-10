@@ -1,0 +1,105 @@
+#!/bin/zsh
+###############################################################################
+# STRATEGY
+# --------
+# 1) Run the tool as root (best-effort; logs outcome).
+# 2) If a console user is logged in, run the tool in that user's GUI context using:
+#       launchctl asuser <uid> sudo -u <user> <tool> ...
+#
+# This forces execution in the correct per-user context (no dependence on a LaunchAgent).
+#
+# LOGGING
+# -------
+# All steps append to /var/log/defaultappctl.log with timestamps + return codes.
+###############################################################################
+
+BASE="/Library/Application Support/DefaultAppCtl"
+CFG="$BASE/defaults.json"
+STATE="$BASE/state.json"
+LOG="/var/log/defaultappctl.log"
+BIN="/usr/local/bin/defaultappctl"
+
+log() {
+  local stamp
+  stamp="$(/bin/date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo "[$stamp] postinstall: $*" >> "$LOG" || true
+}
+
+log "START"
+log "INFO BIN=$BIN"
+log "INFO CFG=$CFG"
+log "INFO STATE=$STATE"
+log "INFO LOG=$LOG"
+
+# Ensure base directory exists
+mkdir -p "$BASE" >/dev/null 2>&1
+log "INFO mkdir -p '$BASE' rc=$?"
+
+# ---------------------------------------------------------------------------
+# 1) Root pass
+# ---------------------------------------------------------------------------
+if [[ -x "$BIN" && -f "$CFG" ]]; then
+  log "ROOT: running defaultappctl"
+  "$BIN" --apply --mode root --config "$CFG" --state "$STATE" --log "$LOG"
+  log "ROOT: defaultappctl rc=$?"
+else
+  log "ROOT: SKIP (missing BIN or CFG) bin_executable? $(test -x "$BIN"; echo $?) cfg_exists? $(test -f "$CFG"; echo $?)"
+fi
+
+# ---------------------------------------------------------------------------
+# 2) User GUI-context pass
+# ---------------------------------------------------------------------------
+CONSOLE_USER="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)"
+RC_STAT=$?
+log "USERPASS: console_user='$CONSOLE_USER' stat_rc=$RC_STAT"
+
+if [[ "$RC_STAT" -ne 0 || -z "$CONSOLE_USER" || "$CONSOLE_USER" == "root" ]]; then
+  log "USERPASS: SKIP (no logged-in GUI user)"
+  log "DONE"
+  exit 0
+fi
+
+UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null)"
+RC_ID=$?
+log "USERPASS: uid='$UID' id_rc=$RC_ID"
+
+if [[ "$RC_ID" -ne 0 || -z "$UID" ]]; then
+  log "USERPASS: ERROR could not determine UID for '$CONSOLE_USER' — skipping"
+  log "DONE"
+  exit 0
+fi
+
+# Check: tool + config exist before attempting user run
+if [[ ! -x "$BIN" ]]; then
+  log "USERPASS: ERROR $BIN not executable — cannot run user pass"
+  log "DONE"
+  exit 0
+fi
+
+if [[ ! -f "$CFG" ]]; then
+  log "USERPASS: ERROR $CFG missing — cannot run user pass"
+  log "DONE"
+  exit 0
+fi
+
+# Run in the user's GUI context. We use BOTH:
+# - launchctl asuser <uid>  (attach to the user's GUI bootstrap)
+# - sudo -u <user>          (run with the user's identity)
+#
+# This combination is commonly needed so LaunchServices changes affect that user's defaults.
+log "USERPASS: running in user GUI context via launchctl asuser $UID + sudo -u $CONSOLE_USER"
+
+# shellcheck disable=SC2024
+/bin/launchctl asuser "$UID" /usr/bin/sudo -u "$CONSOLE_USER" \
+  "$BIN" --apply --mode user --config "$CFG" --state "$STATE" --log "$LOG"
+RC_USER=$?
+
+log "USERPASS: defaultappctl rc=$RC_USER"
+
+# Optional: write a marker so you can prove the user-pass ran
+MARKER="/var/tmp/com.yourorg.defaultappctl.userpass.ran"
+echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") rc=$RC_USER user=$CONSOLE_USER uid=$UID" > "$MARKER" 2>/dev/null
+log "USERPASS: wrote marker $MARKER rc=$?"
+
+log "DONE"
+exit 0
