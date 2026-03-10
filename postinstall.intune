@@ -1,0 +1,197 @@
+#!/bin/zsh
+#
+# postinstall (PackageKit/Intune)
+# ------------------------------
+# Purpose:
+#   Install a helper CLI wrapper:  /usr/local/bin/defaultappctl-user
+#   and its man page:              /usr/local/share/man/man1/defaultappctl-user.1
+#
+# Why:
+#   - Running defaultappctl from installer contexts can be unreliable for per-user defaults.
+#   - This wrapper is meant to be run manually by the logged-in user (Terminal) to:
+#       * wait for dependency apps to be installed (Chrome/Outlook/Acrobat)
+#       * repeatedly run defaultappctl in --mode user
+#       * stop only when all expected "OK ..." lines appear in the log output
+#
+# Logging:
+#   - PackageKit sometimes cannot write to /var/log in installer contexts (permission denied).
+#     Use /var/tmp for postinstall logging to avoid that failure mode. [1](https://christiancareministry-my.sharepoint.com/personal/bharmon_yourorg_org/Documents/Microsoft%20Copilot%20Chat%20Files/DefaultAppCtl.txt)
+#
+
+set -u
+
+POSTLOG="/var/tmp/defaultappctl.wrapper.postinstall.log"
+
+log() {
+  # Best-effort logging; should not fail the installation if logging fails.
+  echo "[$(/bin/date -u +"%Y-%m-%dT%H:%M:%SZ")] postinstall: $*" >> "$POSTLOG" 2>/dev/null || true
+}
+
+# Where we install the wrapper and man page
+WRAPPER="/usr/local/bin/defaultappctl-user"
+MANDIR="/usr/local/share/man/man1"
+MANPAGE="${MANDIR}/defaultappctl-user.1"
+
+log "START"
+log "Installing wrapper -> $WRAPPER"
+log "Installing man page -> $MANPAGE"
+
+# Ensure destination directories exist
+/bin/mkdir -p /usr/local/bin >/dev/null 2>&1 || true
+/bin/mkdir -p "$MANDIR" >/dev/null 2>&1 || true
+
+###############################################################################
+# Write the wrapper executable
+###############################################################################
+cat > "$WRAPPER" <<'EOF'
+#!/bin/zsh
+# defaultappctl-user — wrapper for defaultappctl (run manually as logged-in user)
+#
+# Behavior:
+#   1) Wait for dependency apps (Chrome/Outlook/Acrobat) up to -w seconds
+#   2) Run defaultappctl in user mode, retrying up to -r seconds
+#   3) Success criteria: stop only when all expected "OK ..." lines are present
+#      in the log output for the configured mappings.
+#
+# Usage:
+#   defaultappctl-user apply [-w secs] [-r secs] [-s secs] [-h]
+#
+# Notes:
+#   - This wrapper is intended for manual Terminal runs (can wait for hours).
+#   - Logs are written to /var/tmp so they are writable in typical environments.
+
+set -u
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+BIN="/usr/local/bin/defaultappctl"
+CFG="/Library/Application Support/DefaultAppCtl/defaults.json"
+
+UID="$(/usr/bin/id -u)"
+USER_NAME="$(/usr/bin/id -un)"
+
+LOG="/var/tmp/defaultappctl.${UID}.manual.user.log"
+STATE="/var/tmp/defaultappctl.${UID}.manual.user.state.json"
+MARKER="/var/tmp/com.yourorg.defaultappctl.manual.userpass.ran"
+
+# Defaults (tune as needed)
+WAIT_DEPS_SECONDS=14400   # 4 hours dependency wait
+RETRY_SECONDS=14400       # 4 hours apply retry window
+SLEEP_SECONDS=10          # poll interval 10 seconds
+
+usage() {
+  echo "Usage: defaultappctl-user apply [-w secs] [-r secs] [-s secs] [-h]"
+  echo "Defaults: -w ${WAIT_DEPS_SECONDS} -r ${RETRY_SECONDS} -s ${SLEEP_SECONDS}"
+  echo "  -w secs  wait up to secs for deps (0 = skip)"
+  echo "  -r secs  retry apply up to secs (0 = single attempt)"
+  echo "  -s secs  sleep interval for dep checks + retries"
+  exit 2
+}
+
+fmt_hms() {
+  local t="$1"
+  local h=$(( t / 3600 ))
+  local m=$(( (t % 3600) / 60 ))
+  local s=$(( t % 60 ))
+  printf "%02d:%02d:%02d" "$h" "$m" "$s"
+}
+
+say() {
+  # Prints to terminal and appends to the log for auditing/troubleshooting.
+  local msg="$*"
+  local ts
+  ts="$(/bin/date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo "[$ts] $msg"
+  echo "[$ts] $msg" >> "$LOG" 2>/dev/null || true
+}
+
+have_app() {
+  # Checks whether an app is installed/registered.
+  # Success if app bundle path exists OR Spotlight can find bundle id.
+  local path="$1" bid="$2"
+  [[ -d "$path" ]] && return 0
+  /usr/bin/mdfind "kMDItemCFBundleIdentifier == '$bid'" 2>/dev/null | /usr/bin/head -n 1 | /usr/bin/grep -q . && return 0
+  return 1
+}
+
+wait_for_deps() {
+  [[ "$WAIT_DEPS_SECONDS" -le 0 ]] && { say "Deps wait disabled (-w 0)"; return 0; }
+
+  local start now elapsed
+  start=$(/bin/date +%s)
+  say "Waiting for dependencies (timeout $(fmt_hms "$WAIT_DEPS_SECONDS"), interval ${SLEEP_SECONDS}s)..."
+
+  while :; do
+    local missing=()
+
+    have_app "/Applications/Google Chrome.app" "com.google.Chrome" || missing+=("Chrome")
+    have_app "/Applications/Microsoft Outlook.app" "com.microsoft.Outlook" || missing+=("Outlook")
+    have_app "/Applications/Adobe Acrobat DC/Adobe Acrobat.app" "com.adobe.Acrobat.Pro" || missing+=("Acrobat")
+
+    if (( ${#missing[@]} == 0 )); then
+      say "Deps OK (Chrome/Outlook/Acrobat present)"
+      return 0
+    fi
+
+    now=$(/bin/date +%s)
+    elapsed=$(( now - start ))
+
+    if (( elapsed >= WAIT_DEPS_SECONDS )); then
+      say "Deps TIMEOUT after $(fmt_hms "$WAIT_DEPS_SECONDS"). Still missing: ${missing[*]}"
+      return 1
+    fi
+
+    say "Waiting for deps (elapsed $(fmt_hms "$elapsed") / $(fmt_hms "$WAIT_DEPS_SECONDS")) missing: ${missing[*]}"
+    /bin/sleep "$SLEEP_SECONDS"
+  done
+}
+
+# Success criteria: all of these lines must appear in $LOG.
+# These patterns match defaultappctl's log strings like:
+#   OK url  http -> com.google.Chrome
+#   OK type com.adobe.pdf -> com.adobe.Acrobat.Pro
+EXPECTED_OK_PATTERNS=(
+  "OK url[[:space:]]+http[[:space:]]+->[[:space:]]+com\\.google\\.Chrome"
+  "OK url[[:space:]]+ical[[:space:]]+->[[:space:]]+com\\.microsoft\\.Outlook"
+  "OK url[[:space:]]+mailto[[:space:]]+->[[:space:]]+com\\.microsoft\\.Outlook"
+  "OK url[[:space:]]+webcal[[:space:]]+->[[:space:]]+com\\.microsoft\\.Outlook"
+  "OK type[[:space:]]+com\\.adobe\\.pdf[[:space:]]+->[[:space:]]+com\\.adobe\\.Acrobat\\.Pro"
+  "OK type[[:space:]]+com\\.apple\\.ical\\.ics[[:space:]]+->[[:space:]]+com\\.microsoft\\.Outlook"
+  "OK type[[:space:]]+com\\.apple\\.ical\\.vcs[[:space:]]+->[[:space:]]+com\\.microsoft\\.Outlook"
+  "OK type[[:space:]]+com\\.apple\\.mail\\.email[[:space:]]+->[[:space:]]+com\\.microsoft\\.Outlook"
+  "OK type[[:space:]]+public\\.vcard[[:space:]]+->[[:space:]]+com\\.microsoft\\.Outlook"
+  "OK type[[:space:]]+public\\.xhtml[[:space:]]+->[[:space:]]+com\\.google\\.Chrome"
+)
+
+all_ok_present() {
+  local pat
+  for pat in "${EXPECTED_OK_PATTERNS[@]}"; do
+    /usr/bin/grep -Eq "$pat" "$LOG" 2>/dev/null || return 1
+  done
+  return 0
+}
+
+missing_ok_lines() {
+  local pat
+  local any=0
+
+  for pat in "${EXPECTED_OK_PATTERNS[@]}"; do
+    if ! /usr/bin/grep -Eq "$pat" "$LOG" 2>/dev/null; then
+      if (( any == 0 )); then
+        echo "Missing expected OK lines:"
+        any=1
+      fi
+      echo "  - $pat"
+    fi
+  done
+
+  (( any == 0 )) && echo "none"
+}
+
+apply_with_retry() {
+  # Start each run with a fresh state file so "state presence" reflects current failures.
+  rm -f "$STATE" 2>/dev/null || true
+
+  local start now elapsed remaining attempt=0
+  start=$(/bin/date +%s)
+
+  if [[ "$RETRY_SECONDS" -le
