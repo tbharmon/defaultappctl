@@ -1,0 +1,18 @@
+{
+  "urls": {
+    "mailto": "com.microsoft.Outlook",
+    "http": "com.google.Chrome",
+    "https": "com.google.Chrome",
+    "ical": "com.microsoft.Outlook",
+    "webcal": "com.microsoft.Outlook"
+  },
+  "types": {
+    "public.html": "com.google.Chrome",
+    "public.xhtml": "com.google.Chrome",
+    "com.adobe.pdf": "com.adobe.Acrobat.Pro",
+    "public.vcard": "com.microsoft.Outlook",
+    "com.apple.ical.ics": "com.microsoft.Outlook",
+    "com.apple.ical.vcs": "com.microsoft.Outlook",
+    "com.apple.mail.email": "com.microsoft.Outlook"
+  }
+}
